@@ -4,7 +4,7 @@ const fetch = require('node-fetch');
 const app = express();
 
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '50mb' }));
 
 /* ================= CONFIG ================= */
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -12,12 +12,20 @@ const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID;
 const ADMIN_USER_ID = process.env.ADMIN_USER_ID;
 const ADMIN_SECRET_KEY = process.env.ADMIN_SECRET_KEY || 'Pinku@2026Secret';
 const IMGBB_API_KEY = process.env.IMGBB_API_KEY || '';
+const JSONBIN_KEY = process.env.JSONBIN_KEY || '';
+const JSONBIN_BIN = process.env.JSONBIN_BIN || '';
 const API_BASE = `https://api.telegram.org/bot${BOT_TOKEN}`;
+const JSONBIN_API = 'https://api.jsonbin.io/v3/b';
 
 /* ================= STORAGE ================= */
 let messages = [];
 let users = {};
-const MAX_MSG = 1000;
+let blockedIPs = new Set();
+let blockedDevices = new Set();
+let leaderboard = {};
+let dailyStats = {};
+let dataLoaded = false;
+const MAX_MSG = 2000;
 
 /* ================= HELPERS ================= */
 async function tgAPI(method, params = {}) {
@@ -38,6 +46,14 @@ function genId() {
     return Date.now().toString(36) + Math.random().toString(36).substr(2, 9);
 }
 
+function getClientIP(req) {
+    return req.headers['x-forwarded-for']?.split(',')[0].trim()
+        || req.headers['x-real-ip']
+        || req.connection?.remoteAddress
+        || req.socket?.remoteAddress
+        || 'unknown';
+}
+
 /* ================= BAD WORDS ================= */
 const BAD_WORDS = ['fuck', 'shit', 'bitch', 'asshole', 'bastard', 'gaali', 'bhosdi', 'madarchod', 'bhenchod'];
 function hasBadWord(text) {
@@ -47,14 +63,11 @@ function hasBadWord(text) {
 
 /* ================= IMGBB UPLOAD ================= */
 async function uploadToImgBB(base64Image) {
-    if (!IMGBB_API_KEY) {
-        console.error('No ImgBB key');
-        return null;
-    }
+    if (!IMGBB_API_KEY) return null;
     try {
         const formData = new URLSearchParams();
         formData.append('key', IMGBB_API_KEY);
-        formData.append('image', base64Image.replace(/^data:image\/\w+;base64,/, ''));
+        formData.append('image', base64Image.replace(/^data:[^;]+;base64,/, ''));
 
         const res = await fetch('https://api.imgbb.com/1/upload', {
             method: 'POST',
@@ -68,6 +81,81 @@ async function uploadToImgBB(base64Image) {
     }
 }
 
+/* ================= LEADERBOARD LOAD/SAVE ================= */
+async function loadLeaderboard() {
+    if (!JSONBIN_KEY || !JSONBIN_BIN) {
+        console.log('⚠️ JSONBin not configured, using in-memory');
+        dataLoaded = true;
+        return;
+    }
+    try {
+        const res = await fetch(`${JSONBIN_API}/${JSONBIN_BIN}/latest`, {
+            headers: { 'X-Master-Key': JSONBIN_KEY }
+        });
+        const data = await res.json();
+        if (data.record) {
+            leaderboard = data.record.leaderboard || {};
+            dailyStats = data.record.dailyStats || {};
+        }
+        dataLoaded = true;
+        console.log('✅ Leaderboard loaded:', Object.keys(leaderboard).length, 'users');
+    } catch(e) {
+        console.error('Load failed:', e.message);
+        dataLoaded = true;
+    }
+}
+
+async function saveLeaderboard() {
+    if (!JSONBIN_KEY || !JSONBIN_BIN) return;
+    try {
+        await fetch(`${JSONBIN_API}/${JSONBIN_BIN}`, {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Master-Key': JSONBIN_KEY
+            },
+            body: JSON.stringify({
+                leaderboard,
+                dailyStats,
+                savedAt: Date.now()
+            })
+        });
+    } catch(e) {
+        console.error('Save failed:', e.message);
+    }
+}
+
+/* Auto save every 30 seconds */
+setInterval(() => {
+    if (dataLoaded) saveLeaderboard();
+}, 30000);
+
+/* Initial load */
+loadLeaderboard();
+
+/* ================= CLEANUP OLD MESSAGES ================= */
+function cleanupOldMessages() {
+    const threeDaysAgo = Date.now() - (3 * 24 * 60 * 60 * 1000);
+    const beforeCount = messages.length;
+    messages = messages.filter(m => m.timestamp > threeDaysAgo);
+    if (messages.length < beforeCount) {
+        console.log(`Cleaned ${beforeCount - messages.length} old messages`);
+    }
+}
+setInterval(cleanupOldMessages, 60 * 60 * 1000);
+
+/* ================= HEALTH CHECK ================= */
+app.get('/', (req, res) => {
+    res.json({
+        ok: true,
+        status: 'Group Chat Server Running',
+        messages: messages.length,
+        users: Object.keys(users).length,
+        blockedIPs: blockedIPs.size,
+        leaderboardUsers: Object.keys(leaderboard).length
+    });
+});
+
 /* ================= TELEGRAM WEBHOOK ================= */
 app.post('/webhook', async (req, res) => {
     res.sendStatus(200);
@@ -80,7 +168,7 @@ app.post('/webhook', async (req, res) => {
         if (msg.from.is_bot) return;
 
         const text = msg.text || msg.caption || '';
-        if (!text && !msg.photo) return;
+        if (!text && !msg.photo && !msg.video && !msg.document) return;
 
         if (text && hasBadWord(text)) {
             await tgAPI('deleteMessage', {
@@ -91,8 +179,20 @@ app.post('/webhook', async (req, res) => {
         }
 
         const isAdmin = msg.from.id.toString() === ADMIN_USER_ID;
+        const userId = isAdmin ? 'admin' : msg.from.id.toString();
+
+        if (!isAdmin && blockedDevices.has(userId)) {
+            await tgAPI('deleteMessage', {
+                chat_id: GROUP_CHAT_ID,
+                message_id: msg.message_id
+            });
+            return;
+        }
 
         let imageUrl = '';
+        let videoUrl = '';
+        let docUrl = '';
+
         if (msg.photo && msg.photo.length > 0) {
             const largest = msg.photo[msg.photo.length - 1];
             const fileInfo = await tgAPI('getFile', { file_id: largest.file_id });
@@ -101,13 +201,29 @@ app.post('/webhook', async (req, res) => {
             }
         }
 
+        if (msg.video) {
+            const fileInfo = await tgAPI('getFile', { file_id: msg.video.file_id });
+            if (fileInfo.ok) {
+                videoUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.result.file_path}`;
+            }
+        }
+
+        if (msg.document) {
+            const fileInfo = await tgAPI('getFile', { file_id: msg.document.file_id });
+            if (fileInfo.ok) {
+                docUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.result.file_path}`;
+            }
+        }
+
         const stored = {
             id: genId(),
             tgMessageId: msg.message_id,
-            userId: isAdmin ? 'admin' : msg.from.id.toString(),
+            userId: userId,
             userName: isAdmin ? 'Admin (Pinku Kumar)' : `${msg.from.first_name || 'User'}${msg.from.last_name ? ' ' + msg.from.last_name : ''}`,
             text: text,
             image: imageUrl,
+            video: videoUrl,
+            document: docUrl,
             isAdmin: isAdmin,
             fromTelegram: true,
             timestamp: msg.date * 1000
@@ -117,11 +233,12 @@ app.post('/webhook', async (req, res) => {
         if (messages.length > MAX_MSG) messages.pop();
 
         if (!isAdmin) {
-            users[msg.from.id] = {
-                id: msg.from.id,
+            users[userId] = {
+                id: userId,
                 name: stored.userName,
                 username: msg.from.username || '',
-                lastSeen: Date.now()
+                lastSeen: Date.now(),
+                ip: users[userId]?.ip || 'unknown'
             };
         }
     } catch(e) {
@@ -132,27 +249,55 @@ app.post('/webhook', async (req, res) => {
 /* ================= REGISTER USER ================= */
 app.post('/api/register', (req, res) => {
     const { name, deviceId } = req.body;
+    const ip = getClientIP(req);
+
     if (!deviceId) return res.status(400).json({ ok: false });
-    
+
+    if (blockedIPs.has(ip)) {
+        return res.status(403).json({ ok: false, error: 'You are blocked', blocked: true });
+    }
+    if (blockedDevices.has(deviceId)) {
+        return res.status(403).json({ ok: false, error: 'You are blocked', blocked: true });
+    }
+
     if (!users[deviceId]) {
         users[deviceId] = {
             id: deviceId,
             name: name || 'Anonymous',
+            ip: ip,
             registeredAt: Date.now(),
             lastSeen: Date.now(),
-            isAppUser: true
+            isAppUser: true,
+            messageCount: 0
         };
     } else {
         users[deviceId].lastSeen = Date.now();
+        users[deviceId].ip = ip;
         if (name) users[deviceId].name = name;
     }
     res.json({ ok: true, user: users[deviceId] });
 });
 
-/* ================= USER SEND → BROADCAST TO ALL ================= */
+/* ================= CHECK BLOCKED ================= */
+app.get('/api/check-block/:deviceId', (req, res) => {
+    const { deviceId } = req.params;
+    const ip = getClientIP(req);
+    const isBlocked = blockedIPs.has(ip) || blockedDevices.has(deviceId);
+    res.json({ ok: true, blocked: isBlocked });
+});
+
+/* ================= USER SEND MESSAGE ================= */
 app.post('/api/send', async (req, res) => {
     const { deviceId, text, name, image } = req.body;
-    
+    const ip = getClientIP(req);
+
+    if (blockedIPs.has(ip)) {
+        return res.status(403).json({ ok: false, error: 'You are blocked', blocked: true });
+    }
+    if (blockedDevices.has(deviceId)) {
+        return res.status(403).json({ ok: false, error: 'You are blocked', blocked: true });
+    }
+
     if (!deviceId || (!text && !image)) {
         return res.status(400).json({ ok: false, error: 'Missing data' });
     }
@@ -171,8 +316,7 @@ app.post('/api/send', async (req, res) => {
         }
     }
 
-    // Send to Telegram group (BACKUP + Admin sees it)
-    const tgText = `💬 <b>${userName}</b>\n\n${text || ''}`;
+    const tgText = `💬 <b>${userName}</b>\n${text || ''}`;
     let tgResult;
 
     if (imageUrl) {
@@ -190,7 +334,6 @@ app.post('/api/send', async (req, res) => {
         });
     }
 
-    // Store in memory (all users see this)
     const stored = {
         id: genId(),
         tgMessageId: tgResult.ok ? tgResult.result.message_id : null,
@@ -200,25 +343,35 @@ app.post('/api/send', async (req, res) => {
         image: imageUrl,
         isAdmin: false,
         fromApp: true,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        ip: ip
     };
 
     messages.unshift(stored);
     if (messages.length > MAX_MSG) messages.pop();
 
+    if (users[deviceId]) {
+        users[deviceId].messageCount = (users[deviceId].messageCount || 0) + 1;
+        users[deviceId].lastSeen = Date.now();
+        users[deviceId].ip = ip;
+    }
+
+    /* Update daily stats */
+    const today = new Date().toISOString().split('T')[0];
+    if (!dailyStats[today]) dailyStats[today] = { activeUsers: 0, quizzes: 0, messages: 0 };
+    dailyStats[today].messages = (dailyStats[today].messages || 0) + 1;
+
     res.json({ ok: true, message: stored });
 });
 
-/* ================= GET ALL MESSAGES (GROUP FEED) ================= */
+/* ================= GET ALL MESSAGES ================= */
 app.get('/api/messages', (req, res) => {
     const since = parseInt(req.query.since || '0');
     const limit = parseInt(req.query.limit || '200');
-    
+
     let filtered = messages;
-    if (since > 0) {
-        filtered = messages.filter(m => m.timestamp > since);
-    }
-    
+    if (since > 0) filtered = messages.filter(m => m.timestamp > since);
+
     res.json({
         ok: true,
         messages: filtered.slice(0, limit).reverse(),
@@ -234,11 +387,13 @@ app.get('/api/admin/messages', (req, res) => {
         ok: true,
         messages: messages,
         users: Object.values(users),
+        blockedIPs: Array.from(blockedIPs),
+        blockedDevices: Array.from(blockedDevices),
         count: messages.length
     });
 });
 
-/* ================= ADMIN SEND (BROADCAST) ================= */
+/* ================= ADMIN SEND ================= */
 app.post('/api/admin/send', async (req, res) => {
     const { key, text, image } = req.body;
     if (key !== ADMIN_SECRET_KEY) return res.status(401).json({ ok: false });
@@ -252,13 +407,13 @@ app.post('/api/admin/send', async (req, res) => {
         tgResult = await tgAPI('sendPhoto', {
             chat_id: GROUP_CHAT_ID,
             photo: imageUrl,
-            caption: `👑 <b>Admin (Pinku Kumar)</b>\n\n${text || ''}`.substring(0, 1024),
+            caption: `👑 <b>Admin</b>\n${text || ''}`.substring(0, 1024),
             parse_mode: 'HTML'
         });
     } else {
         tgResult = await tgAPI('sendMessage', {
             chat_id: GROUP_CHAT_ID,
-            text: `👑 <b>Admin (Pinku Kumar)</b>\n\n${text}`,
+            text: `👑 <b>Admin</b>\n${text}`,
             parse_mode: 'HTML'
         });
     }
@@ -280,7 +435,7 @@ app.post('/api/admin/send', async (req, res) => {
     res.json({ ok: true, message: stored });
 });
 
-/* ================= ADMIN DELETE ================= */
+/* ================= ADMIN: DELETE MESSAGE ================= */
 app.post('/api/admin/delete', async (req, res) => {
     const { key, messageId } = req.body;
     if (key !== ADMIN_SECRET_KEY) return res.status(401).json({ ok: false });
@@ -297,17 +452,137 @@ app.post('/api/admin/delete', async (req, res) => {
     res.json({ ok: true });
 });
 
-/* ================= HEALTH CHECK ================= */
-app.get('/', (req, res) => {
+/* ================= ADMIN: BLOCK/UNBLOCK ================= */
+app.post('/api/admin/block-ip', (req, res) => {
+    const { key, ip } = req.body;
+    if (key !== ADMIN_SECRET_KEY) return res.status(401).json({ ok: false });
+    if (ip) blockedIPs.add(ip);
+    res.json({ ok: true, blockedIPs: Array.from(blockedIPs) });
+});
+
+app.post('/api/admin/unblock-ip', (req, res) => {
+    const { key, ip } = req.body;
+    if (key !== ADMIN_SECRET_KEY) return res.status(401).json({ ok: false });
+    blockedIPs.delete(ip);
+    res.json({ ok: true, blockedIPs: Array.from(blockedIPs) });
+});
+
+app.post('/api/admin/block-device', (req, res) => {
+    const { key, deviceId } = req.body;
+    if (key !== ADMIN_SECRET_KEY) return res.status(401).json({ ok: false });
+    if (deviceId) blockedDevices.add(deviceId);
+    res.json({ ok: true, blockedDevices: Array.from(blockedDevices) });
+});
+
+app.post('/api/admin/unblock-device', (req, res) => {
+    const { key, deviceId } = req.body;
+    if (key !== ADMIN_SECRET_KEY) return res.status(401).json({ ok: false });
+    blockedDevices.delete(deviceId);
+    res.json({ ok: true, blockedDevices: Array.from(blockedDevices) });
+});
+
+/* ================= LEADERBOARD: SUBMIT SCORE ================= */
+app.post('/api/leaderboard/submit', async (req, res) => {
+    const { deviceId, name, xp, correct, wrong, streak } = req.body;
+    if (!deviceId) return res.status(400).json({ ok: false });
+
+    if (!leaderboard[deviceId]) {
+        leaderboard[deviceId] = {
+            id: deviceId,
+            name: name || 'User',
+            xp: 0,
+            quizzes: 0,
+            correct: 0,
+            wrong: 0,
+            bestStreak: 0,
+            joinedAt: Date.now(),
+            lastPlayed: Date.now()
+        };
+    }
+
+    const user = leaderboard[deviceId];
+    user.xp += xp || 0;
+    user.quizzes += 1;
+    user.correct += correct || 0;
+    user.wrong += wrong || 0;
+    user.bestStreak = Math.max(user.bestStreak, streak || 0);
+    user.lastPlayed = Date.now();
+    if (name) user.name = name;
+
+    const total = user.correct + user.wrong;
+    user.accuracy = total > 0 ? Math.round((user.correct / total) * 100) : 0;
+
+    const sorted = Object.values(leaderboard).sort((a, b) => b.xp - a.xp);
+    const rank = sorted.findIndex(u => u.id === deviceId) + 1;
+
+    const today = new Date().toISOString().split('T')[0];
+    if (!dailyStats[today]) dailyStats[today] = { activeUsers: 0, quizzes: 0 };
+    dailyStats[today].quizzes = (dailyStats[today].quizzes || 0) + 1;
+    dailyStats[today].activeUsers = Object.keys(leaderboard).length;
+
+    saveLeaderboard();
+    res.json({ ok: true, rank, xp: user.xp, totalUsers: sorted.length });
+});
+
+/* ================= LEADERBOARD: GET TOP ================= */
+app.get('/api/leaderboard', (req, res) => {
+    const limit = parseInt(req.query.limit || '50');
+
+    const sorted = Object.values(leaderboard)
+        .sort((a, b) => {
+            if (b.xp !== a.xp) return b.xp - a.xp;
+            if (b.accuracy !== a.accuracy) return b.accuracy - a.accuracy;
+            return b.bestStreak - a.bestStreak;
+        })
+        .slice(0, limit)
+        .map((u, i) => ({ ...u, rank: i + 1 }));
+
     res.json({
         ok: true,
-        status: 'Group Chat Server Running',
-        messages: messages.length,
-        users: Object.keys(users).length
+        top: sorted,
+        totalUsers: Object.keys(leaderboard).length,
+        updatedAt: Date.now()
     });
 });
 
+/* ================= LEADERBOARD: GET USER RANK ================= */
+app.get('/api/leaderboard/rank/:deviceId', (req, res) => {
+    const { deviceId } = req.params;
+
+    if (!leaderboard[deviceId]) {
+        return res.json({ ok: true, rank: null, user: null });
+    }
+
+    const sorted = Object.values(leaderboard).sort((a, b) => b.xp - a.xp);
+    const rank = sorted.findIndex(u => u.id === deviceId) + 1;
+    const total = sorted.length;
+
+    res.json({
+        ok: true,
+        rank,
+        user: leaderboard[deviceId],
+        totalUsers: total,
+        percentile: total > 0 ? Math.round(((total - rank) / total) * 100) : 0
+    });
+});
+
+/* ================= STATS: DAILY ================= */
+app.get('/api/stats/daily', (req, res) => {
+    const today = new Date().toISOString().split('T')[0];
+    res.json({
+        ok: true,
+        today: dailyStats[today] || { activeUsers: 0, quizzes: 0, messages: 0 },
+        allTime: {
+            totalUsers: Object.keys(leaderboard).length,
+            totalQuizzes: Object.values(leaderboard).reduce((s, u) => s + u.quizzes, 0),
+            totalXP: Object.values(leaderboard).reduce((s, u) => s + u.xp, 0),
+            totalMessages: messages.length
+        }
+    });
+});
+
+/* ================= START SERVER ================= */
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 
 module.exports = app;
