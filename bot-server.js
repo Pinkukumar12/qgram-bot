@@ -24,6 +24,7 @@ let blockedIPs = new Set();
 let blockedDevices = new Set();
 let leaderboard = {};
 let dailyStats = {};
+let dailyQuizRecords = {};
 let dataLoaded = false;
 const MAX_MSG = 2000;
 
@@ -68,7 +69,6 @@ async function uploadToImgBB(base64Image) {
         const formData = new URLSearchParams();
         formData.append('key', IMGBB_API_KEY);
         formData.append('image', base64Image.replace(/^data:[^;]+;base64,/, ''));
-
         const res = await fetch('https://api.imgbb.com/1/upload', {
             method: 'POST',
             body: formData
@@ -81,10 +81,10 @@ async function uploadToImgBB(base64Image) {
     }
 }
 
-/* ================= LEADERBOARD LOAD/SAVE ================= */
+/* ================= JSONBIN LOAD/SAVE ================= */
 async function loadLeaderboard() {
     if (!JSONBIN_KEY || !JSONBIN_BIN) {
-        console.log('⚠️ JSONBin not configured, using in-memory');
+        console.log('⚠️ JSONBin not configured');
         dataLoaded = true;
         return;
     }
@@ -96,6 +96,7 @@ async function loadLeaderboard() {
         if (data.record) {
             leaderboard = data.record.leaderboard || {};
             dailyStats = data.record.dailyStats || {};
+            dailyQuizRecords = data.record.dailyQuizRecords || {};
         }
         dataLoaded = true;
         console.log('✅ Leaderboard loaded:', Object.keys(leaderboard).length, 'users');
@@ -117,6 +118,7 @@ async function saveLeaderboard() {
             body: JSON.stringify({
                 leaderboard,
                 dailyStats,
+                dailyQuizRecords,
                 savedAt: Date.now()
             })
         });
@@ -125,22 +127,16 @@ async function saveLeaderboard() {
     }
 }
 
-/* Auto save every 30 seconds */
 setInterval(() => {
     if (dataLoaded) saveLeaderboard();
 }, 30000);
 
-/* Initial load */
 loadLeaderboard();
 
 /* ================= CLEANUP OLD MESSAGES ================= */
 function cleanupOldMessages() {
     const threeDaysAgo = Date.now() - (3 * 24 * 60 * 60 * 1000);
-    const beforeCount = messages.length;
     messages = messages.filter(m => m.timestamp > threeDaysAgo);
-    if (messages.length < beforeCount) {
-        console.log(`Cleaned ${beforeCount - messages.length} old messages`);
-    }
 }
 setInterval(cleanupOldMessages, 60 * 60 * 1000);
 
@@ -160,7 +156,6 @@ app.get('/', (req, res) => {
 app.post('/webhook', async (req, res) => {
     res.sendStatus(200);
     const update = req.body;
-
     try {
         if (!update.message) return;
         const msg = update.message;
@@ -189,30 +184,20 @@ app.post('/webhook', async (req, res) => {
             return;
         }
 
-        let imageUrl = '';
-        let videoUrl = '';
-        let docUrl = '';
+        let imageUrl = '', videoUrl = '', docUrl = '';
 
         if (msg.photo && msg.photo.length > 0) {
             const largest = msg.photo[msg.photo.length - 1];
             const fileInfo = await tgAPI('getFile', { file_id: largest.file_id });
-            if (fileInfo.ok) {
-                imageUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.result.file_path}`;
-            }
+            if (fileInfo.ok) imageUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.result.file_path}`;
         }
-
         if (msg.video) {
             const fileInfo = await tgAPI('getFile', { file_id: msg.video.file_id });
-            if (fileInfo.ok) {
-                videoUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.result.file_path}`;
-            }
+            if (fileInfo.ok) videoUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.result.file_path}`;
         }
-
         if (msg.document) {
             const fileInfo = await tgAPI('getFile', { file_id: msg.document.file_id });
-            if (fileInfo.ok) {
-                docUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.result.file_path}`;
-            }
+            if (fileInfo.ok) docUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.result.file_path}`;
         }
 
         const stored = {
@@ -220,12 +205,8 @@ app.post('/webhook', async (req, res) => {
             tgMessageId: msg.message_id,
             userId: userId,
             userName: isAdmin ? 'Admin (Pinku Kumar)' : `${msg.from.first_name || 'User'}${msg.from.last_name ? ' ' + msg.from.last_name : ''}`,
-            text: text,
-            image: imageUrl,
-            video: videoUrl,
-            document: docUrl,
-            isAdmin: isAdmin,
-            fromTelegram: true,
+            text: text, image: imageUrl, video: videoUrl, document: docUrl,
+            isAdmin: isAdmin, fromTelegram: true,
             timestamp: msg.date * 1000
         };
 
@@ -234,8 +215,7 @@ app.post('/webhook', async (req, res) => {
 
         if (!isAdmin) {
             users[userId] = {
-                id: userId,
-                name: stored.userName,
+                id: userId, name: stored.userName,
                 username: msg.from.username || '',
                 lastSeen: Date.now(),
                 ip: users[userId]?.ip || 'unknown'
@@ -250,25 +230,16 @@ app.post('/webhook', async (req, res) => {
 app.post('/api/register', (req, res) => {
     const { name, deviceId } = req.body;
     const ip = getClientIP(req);
-
     if (!deviceId) return res.status(400).json({ ok: false });
 
-    if (blockedIPs.has(ip)) {
-        return res.status(403).json({ ok: false, error: 'You are blocked', blocked: true });
-    }
-    if (blockedDevices.has(deviceId)) {
-        return res.status(403).json({ ok: false, error: 'You are blocked', blocked: true });
-    }
+    if (blockedIPs.has(ip)) return res.status(403).json({ ok: false, error: 'Blocked', blocked: true });
+    if (blockedDevices.has(deviceId)) return res.status(403).json({ ok: false, error: 'Blocked', blocked: true });
 
     if (!users[deviceId]) {
         users[deviceId] = {
-            id: deviceId,
-            name: name || 'Anonymous',
-            ip: ip,
-            registeredAt: Date.now(),
-            lastSeen: Date.now(),
-            isAppUser: true,
-            messageCount: 0
+            id: deviceId, name: name || 'Anonymous',
+            ip: ip, registeredAt: Date.now(), lastSeen: Date.now(),
+            isAppUser: true, messageCount: 0
         };
     } else {
         users[deviceId].lastSeen = Date.now();
@@ -291,29 +262,17 @@ app.post('/api/send', async (req, res) => {
     const { deviceId, text, name, image } = req.body;
     const ip = getClientIP(req);
 
-    if (blockedIPs.has(ip)) {
-        return res.status(403).json({ ok: false, error: 'You are blocked', blocked: true });
-    }
-    if (blockedDevices.has(deviceId)) {
-        return res.status(403).json({ ok: false, error: 'You are blocked', blocked: true });
-    }
-
-    if (!deviceId || (!text && !image)) {
-        return res.status(400).json({ ok: false, error: 'Missing data' });
-    }
-
-    if (text && hasBadWord(text)) {
-        return res.status(400).json({ ok: false, error: 'Bad words not allowed' });
-    }
+    if (blockedIPs.has(ip)) return res.status(403).json({ ok: false, error: 'Blocked', blocked: true });
+    if (blockedDevices.has(deviceId)) return res.status(403).json({ ok: false, error: 'Blocked', blocked: true });
+    if (!deviceId || (!text && !image)) return res.status(400).json({ ok: false, error: 'Missing data' });
+    if (text && hasBadWord(text)) return res.status(400).json({ ok: false, error: 'Bad words' });
 
     const userName = name || users[deviceId]?.name || 'User';
     let imageUrl = '';
 
     if (image) {
         imageUrl = await uploadToImgBB(image);
-        if (!imageUrl) {
-            return res.status(500).json({ ok: false, error: 'Image upload failed' });
-        }
+        if (!imageUrl) return res.status(500).json({ ok: false, error: 'Image upload failed' });
     }
 
     const tgText = `💬 <b>${userName}</b>\n${text || ''}`;
@@ -321,30 +280,22 @@ app.post('/api/send', async (req, res) => {
 
     if (imageUrl) {
         tgResult = await tgAPI('sendPhoto', {
-            chat_id: GROUP_CHAT_ID,
-            photo: imageUrl,
-            caption: tgText.substring(0, 1024),
-            parse_mode: 'HTML'
+            chat_id: GROUP_CHAT_ID, photo: imageUrl,
+            caption: tgText.substring(0, 1024), parse_mode: 'HTML'
         });
     } else {
         tgResult = await tgAPI('sendMessage', {
-            chat_id: GROUP_CHAT_ID,
-            text: tgText,
-            parse_mode: 'HTML'
+            chat_id: GROUP_CHAT_ID, text: tgText, parse_mode: 'HTML'
         });
     }
 
     const stored = {
         id: genId(),
         tgMessageId: tgResult.ok ? tgResult.result.message_id : null,
-        userId: deviceId,
-        userName: userName,
-        text: text || '',
-        image: imageUrl,
-        isAdmin: false,
-        fromApp: true,
-        timestamp: Date.now(),
-        ip: ip
+        userId: deviceId, userName: userName,
+        text: text || '', image: imageUrl,
+        isAdmin: false, fromApp: true,
+        timestamp: Date.now(), ip: ip
     };
 
     messages.unshift(stored);
@@ -356,7 +307,6 @@ app.post('/api/send', async (req, res) => {
         users[deviceId].ip = ip;
     }
 
-    /* Update daily stats */
     const today = new Date().toISOString().split('T')[0];
     if (!dailyStats[today]) dailyStats[today] = { activeUsers: 0, quizzes: 0, messages: 0 };
     dailyStats[today].messages = (dailyStats[today].messages || 0) + 1;
@@ -368,15 +318,9 @@ app.post('/api/send', async (req, res) => {
 app.get('/api/messages', (req, res) => {
     const since = parseInt(req.query.since || '0');
     const limit = parseInt(req.query.limit || '200');
-
     let filtered = messages;
     if (since > 0) filtered = messages.filter(m => m.timestamp > since);
-
-    res.json({
-        ok: true,
-        messages: filtered.slice(0, limit).reverse(),
-        count: filtered.length
-    });
+    res.json({ ok: true, messages: filtered.slice(0, limit).reverse(), count: filtered.length });
 });
 
 /* ================= ADMIN: GET ALL ================= */
@@ -384,8 +328,7 @@ app.get('/api/admin/messages', (req, res) => {
     const { key } = req.query;
     if (key !== ADMIN_SECRET_KEY) return res.status(401).json({ ok: false });
     res.json({
-        ok: true,
-        messages: messages,
+        ok: true, messages: messages,
         users: Object.values(users),
         blockedIPs: Array.from(blockedIPs),
         blockedDevices: Array.from(blockedDevices),
@@ -405,8 +348,7 @@ app.post('/api/admin/send', async (req, res) => {
     let tgResult;
     if (imageUrl) {
         tgResult = await tgAPI('sendPhoto', {
-            chat_id: GROUP_CHAT_ID,
-            photo: imageUrl,
+            chat_id: GROUP_CHAT_ID, photo: imageUrl,
             caption: `👑 <b>Admin</b>\n${text || ''}`.substring(0, 1024),
             parse_mode: 'HTML'
         });
@@ -421,33 +363,25 @@ app.post('/api/admin/send', async (req, res) => {
     const stored = {
         id: genId(),
         tgMessageId: tgResult.ok ? tgResult.result.message_id : null,
-        userId: 'admin',
-        userName: 'Admin (Pinku Kumar)',
-        text: text || '',
-        image: imageUrl,
-        isAdmin: true,
-        timestamp: Date.now()
+        userId: 'admin', userName: 'Admin (Pinku Kumar)',
+        text: text || '', image: imageUrl,
+        isAdmin: true, timestamp: Date.now()
     };
 
     messages.unshift(stored);
     if (messages.length > MAX_MSG) messages.pop();
-
     res.json({ ok: true, message: stored });
 });
 
-/* ================= ADMIN: DELETE MESSAGE ================= */
+/* ================= ADMIN: DELETE ================= */
 app.post('/api/admin/delete', async (req, res) => {
     const { key, messageId } = req.body;
     if (key !== ADMIN_SECRET_KEY) return res.status(401).json({ ok: false });
 
     const msg = messages.find(m => m.id === messageId);
     if (msg && msg.tgMessageId) {
-        await tgAPI('deleteMessage', {
-            chat_id: GROUP_CHAT_ID,
-            message_id: msg.tgMessageId
-        });
+        await tgAPI('deleteMessage', { chat_id: GROUP_CHAT_ID, message_id: msg.tgMessageId });
     }
-
     messages = messages.filter(m => m.id !== messageId);
     res.json({ ok: true });
 });
@@ -457,46 +391,40 @@ app.post('/api/admin/block-ip', (req, res) => {
     const { key, ip } = req.body;
     if (key !== ADMIN_SECRET_KEY) return res.status(401).json({ ok: false });
     if (ip) blockedIPs.add(ip);
-    res.json({ ok: true, blockedIPs: Array.from(blockedIPs) });
+    res.json({ ok: true });
 });
 
 app.post('/api/admin/unblock-ip', (req, res) => {
     const { key, ip } = req.body;
     if (key !== ADMIN_SECRET_KEY) return res.status(401).json({ ok: false });
     blockedIPs.delete(ip);
-    res.json({ ok: true, blockedIPs: Array.from(blockedIPs) });
+    res.json({ ok: true });
 });
 
 app.post('/api/admin/block-device', (req, res) => {
     const { key, deviceId } = req.body;
     if (key !== ADMIN_SECRET_KEY) return res.status(401).json({ ok: false });
     if (deviceId) blockedDevices.add(deviceId);
-    res.json({ ok: true, blockedDevices: Array.from(blockedDevices) });
+    res.json({ ok: true });
 });
 
 app.post('/api/admin/unblock-device', (req, res) => {
     const { key, deviceId } = req.body;
     if (key !== ADMIN_SECRET_KEY) return res.status(401).json({ ok: false });
     blockedDevices.delete(deviceId);
-    res.json({ ok: true, blockedDevices: Array.from(blockedDevices) });
+    res.json({ ok: true });
 });
 
-/* ================= LEADERBOARD: SUBMIT SCORE ================= */
+/* ================= LEADERBOARD: SUBMIT (XP) ================= */
 app.post('/api/leaderboard/submit', async (req, res) => {
     const { deviceId, name, xp, correct, wrong, streak } = req.body;
     if (!deviceId) return res.status(400).json({ ok: false });
 
     if (!leaderboard[deviceId]) {
         leaderboard[deviceId] = {
-            id: deviceId,
-            name: name || 'User',
-            xp: 0,
-            quizzes: 0,
-            correct: 0,
-            wrong: 0,
-            bestStreak: 0,
-            joinedAt: Date.now(),
-            lastPlayed: Date.now()
+            id: deviceId, name: name || 'User',
+            xp: 0, quizzes: 0, correct: 0, wrong: 0,
+            bestStreak: 0, joinedAt: Date.now(), lastPlayed: Date.now()
         };
     }
 
@@ -524,10 +452,72 @@ app.post('/api/leaderboard/submit', async (req, res) => {
     res.json({ ok: true, rank, xp: user.xp, totalUsers: sorted.length });
 });
 
-/* ================= LEADERBOARD: GET TOP ================= */
+/* ================= LEADERBOARD: DAILY SUBMIT (with Time) ================= */
+app.post('/api/leaderboard/daily-submit', async (req, res) => {
+    const { deviceId, name, correct, wrong, timeTaken, streak, totalQuestions } = req.body;
+    if (!deviceId) return res.status(400).json({ ok: false });
+
+    const negativeMark = wrong / 3;
+    const score = Math.max(0, correct - negativeMark);
+    const scoreRounded = Math.round(score * 100) / 100;
+
+    const today = new Date().toISOString().split('T')[0];
+    if (!dailyQuizRecords[today]) dailyQuizRecords[today] = {};
+
+    const existing = dailyQuizRecords[today][deviceId];
+    const isBetter = !existing ||
+        scoreRounded > existing.score ||
+        (scoreRounded === existing.score && timeTaken < existing.timeTaken);
+
+    if (isBetter) {
+        dailyQuizRecords[today][deviceId] = {
+            id: deviceId, name: name || 'User',
+            score: scoreRounded, correct: correct || 0, wrong: wrong || 0,
+            timeTaken: timeTaken || 0, streak: streak || 0,
+            totalQuestions: totalQuestions || 0,
+            accuracy: correct > 0 ? Math.round((correct / (correct + wrong)) * 100) : 0,
+            submittedAt: Date.now()
+        };
+
+        // Also update main XP leaderboard
+        if (!leaderboard[deviceId]) {
+            leaderboard[deviceId] = {
+                id: deviceId, name: name || 'User',
+                xp: 0, quizzes: 0, correct: 0, wrong: 0,
+                bestStreak: 0, joinedAt: Date.now(), lastPlayed: Date.now()
+            };
+        }
+        const u = leaderboard[deviceId];
+        const xpGained = Math.max(0, correct * 10 - wrong * 3);
+        u.xp += xpGained;
+        u.quizzes += 1;
+        u.correct += correct;
+        u.wrong += wrong;
+        u.bestStreak = Math.max(u.bestStreak, streak || 0);
+        u.lastPlayed = Date.now();
+        if (name) u.name = name;
+        const tot = u.correct + u.wrong;
+        u.accuracy = tot > 0 ? Math.round((u.correct / tot) * 100) : 0;
+
+        saveLeaderboard();
+    }
+
+    const sorted = Object.values(dailyQuizRecords[today]).sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return a.timeTaken - b.timeTaken;
+    });
+    const rank = sorted.findIndex(u => u.id === deviceId) + 1;
+
+    res.json({
+        ok: true, rank, score: scoreRounded,
+        totalUsers: sorted.length,
+        xpGained: Math.max(0, correct * 10 - wrong * 3)
+    });
+});
+
+/* ================= LEADERBOARD: GET TOP XP ================= */
 app.get('/api/leaderboard', (req, res) => {
     const limit = parseInt(req.query.limit || '50');
-
     const sorted = Object.values(leaderboard)
         .sort((a, b) => {
             if (b.xp !== a.xp) return b.xp - a.xp;
@@ -536,31 +526,82 @@ app.get('/api/leaderboard', (req, res) => {
         })
         .slice(0, limit)
         .map((u, i) => ({ ...u, rank: i + 1 }));
-
-    res.json({
-        ok: true,
-        top: sorted,
-        totalUsers: Object.keys(leaderboard).length,
-        updatedAt: Date.now()
-    });
+    res.json({ ok: true, top: sorted, totalUsers: Object.keys(leaderboard).length, updatedAt: Date.now() });
 });
 
-/* ================= LEADERBOARD: GET USER RANK ================= */
+/* ================= LEADERBOARD: GET DAILY ================= */
+app.get('/api/leaderboard/daily', (req, res) => {
+    const date = req.query.date || new Date().toISOString().split('T')[0];
+    const limit = parseInt(req.query.limit || '50');
+    const records = dailyQuizRecords[date] || {};
+    const sorted = Object.values(records)
+        .sort((a, b) => {
+            if (b.score !== a.score) return b.score - a.score;
+            return a.timeTaken - b.timeTaken;
+        })
+        .slice(0, limit)
+        .map((u, i) => ({ ...u, rank: i + 1 }));
+    res.json({ ok: true, date, top: sorted, totalUsers: Object.keys(records).length });
+});
+
+/* ================= LEADERBOARD: GET STREAK ================= */
+app.get('/api/leaderboard/streak', (req, res) => {
+    const limit = parseInt(req.query.limit || '50');
+    const sorted = Object.values(leaderboard)
+        .sort((a, b) => b.bestStreak - a.bestStreak)
+        .slice(0, limit)
+        .map((u, i) => ({
+            rank: i + 1, id: u.id, name: u.name,
+            streak: u.bestStreak || 0, xp: u.xp,
+            quizzes: u.quizzes, accuracy: u.accuracy
+        }));
+    res.json({ ok: true, top: sorted, totalUsers: Object.keys(leaderboard).length });
+});
+
+/* ================= LEADERBOARD: GET XP ================= */
+app.get('/api/leaderboard/xp', (req, res) => {
+    const limit = parseInt(req.query.limit || '50');
+    const sorted = Object.values(leaderboard)
+        .sort((a, b) => b.xp - a.xp)
+        .slice(0, limit)
+        .map((u, i) => ({
+            rank: i + 1, id: u.id, name: u.name,
+            xp: u.xp, quizzes: u.quizzes,
+            accuracy: u.accuracy, bestStreak: u.bestStreak
+        }));
+    res.json({ ok: true, top: sorted, totalUsers: Object.keys(leaderboard).length });
+});
+
+/* ================= LEADERBOARD: USER RANK ================= */
 app.get('/api/leaderboard/rank/:deviceId', (req, res) => {
     const { deviceId } = req.params;
-
-    if (!leaderboard[deviceId]) {
-        return res.json({ ok: true, rank: null, user: null });
-    }
-
+    if (!leaderboard[deviceId]) return res.json({ ok: true, rank: null, user: null });
     const sorted = Object.values(leaderboard).sort((a, b) => b.xp - a.xp);
     const rank = sorted.findIndex(u => u.id === deviceId) + 1;
     const total = sorted.length;
-
     res.json({
-        ok: true,
-        rank,
+        ok: true, rank,
         user: leaderboard[deviceId],
+        totalUsers: total,
+        percentile: total > 0 ? Math.round(((total - rank) / total) * 100) : 0
+    });
+});
+
+/* ================= LEADERBOARD: USER DAILY RANK ================= */
+app.get('/api/leaderboard/daily-rank/:deviceId', (req, res) => {
+    const { deviceId } = req.params;
+    const date = req.query.date || new Date().toISOString().split('T')[0];
+    const records = dailyQuizRecords[date] || {};
+    if (!records[deviceId]) return res.json({ ok: true, rank: null, user: null });
+    const sorted = Object.values(records).sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return a.timeTaken - b.timeTaken;
+    });
+    const rank = sorted.findIndex(u => u.id === deviceId) + 1;
+    const total = sorted.length;
+    res.json({
+        ok: true, rank,
+        user: records[deviceId],
         totalUsers: total,
         percentile: total > 0 ? Math.round(((total - rank) / total) * 100) : 0
     });
