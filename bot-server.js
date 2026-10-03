@@ -55,6 +55,10 @@ function getClientIP(req) {
         || 'unknown';
 }
 
+function getToday() {
+    return new Date().toISOString().split('T')[0];
+}
+
 /* ================= BAD WORDS ================= */
 const BAD_WORDS = ['fuck', 'shit', 'bitch', 'asshole', 'bastard', 'gaali', 'bhosdi', 'madarchod', 'bhenchod'];
 function hasBadWord(text) {
@@ -93,13 +97,28 @@ async function loadLeaderboard() {
             headers: { 'X-Master-Key': JSONBIN_KEY }
         });
         const data = await res.json();
+        
         if (data.record) {
             leaderboard = data.record.leaderboard || {};
             dailyStats = data.record.dailyStats || {};
             dailyQuizRecords = data.record.dailyQuizRecords || {};
+            
+            // ✅ AUTO-CLEAN: 7 din se purane daily records delete
+            const today = getToday();
+            const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+            
+            Object.keys(dailyQuizRecords).forEach(date => {
+                const dateTs = new Date(date).getTime();
+                if (dateTs < sevenDaysAgo && date !== today) {
+                    delete dailyQuizRecords[date];
+                    console.log('🗑️ Deleted old daily record:', date);
+                }
+            });
+            
+            console.log('✅ Loaded:', Object.keys(leaderboard).length, 'users');
+            console.log('📅 Daily records:', Object.keys(dailyQuizRecords).length, 'dates');
         }
         dataLoaded = true;
-        console.log('✅ Leaderboard loaded:', Object.keys(leaderboard).length, 'users');
     } catch(e) {
         console.error('Load failed:', e.message);
         dataLoaded = true;
@@ -148,7 +167,8 @@ app.get('/', (req, res) => {
         messages: messages.length,
         users: Object.keys(users).length,
         blockedIPs: blockedIPs.size,
-        leaderboardUsers: Object.keys(leaderboard).length
+        leaderboardUsers: Object.keys(leaderboard).length,
+        dailyDates: Object.keys(dailyQuizRecords).length
     });
 });
 
@@ -307,7 +327,7 @@ app.post('/api/send', async (req, res) => {
         users[deviceId].ip = ip;
     }
 
-    const today = new Date().toISOString().split('T')[0];
+    const today = getToday();
     if (!dailyStats[today]) dailyStats[today] = { activeUsers: 0, quizzes: 0, messages: 0 };
     dailyStats[today].messages = (dailyStats[today].messages || 0) + 1;
 
@@ -415,7 +435,94 @@ app.post('/api/admin/unblock-device', (req, res) => {
     res.json({ ok: true });
 });
 
-/* ================= LEADERBOARD: SUBMIT (XP) ================= */
+/* ================= LEADERBOARD: DAILY SUBMIT (Sirf Daily Quiz) ================= */
+app.post('/api/leaderboard/daily-submit', async (req, res) => {
+    const { deviceId, name, correct, wrong, timeTaken, streak, totalQuestions, quizType } = req.body;
+
+    if (!deviceId) return res.status(400).json({ ok: false, error: 'No deviceId' });
+
+    // ✅ Only accept Daily Quiz
+    if (quizType && quizType !== 'daily') {
+        console.log('⚠️ Skipped non-daily:', quizType);
+        return res.json({ ok: true, skipped: true, reason: 'Not a daily quiz' });
+    }
+
+    // Negative marking: -1/3 per wrong
+    const negativeMark = wrong / 3;
+    const score = Math.max(0, correct - negativeMark);
+    const scoreRounded = Math.round(score * 100) / 100;
+
+    const today = getToday();
+    if (!dailyQuizRecords[today]) dailyQuizRecords[today] = {};
+
+    const existing = dailyQuizRecords[today][deviceId];
+
+    // Only save if better score OR same score + faster time
+    const isBetter = !existing ||
+        scoreRounded > existing.score ||
+        (scoreRounded === existing.score && timeTaken < existing.timeTaken);
+
+    if (isBetter) {
+        dailyQuizRecords[today][deviceId] = {
+            id: deviceId,
+            name: name || 'User',
+            score: scoreRounded,
+            correct: correct || 0,
+            wrong: wrong || 0,
+            timeTaken: timeTaken || 0,
+            streak: streak || 0,
+            totalQuestions: totalQuestions || 0,
+            accuracy: correct > 0 ? Math.round((correct / (correct + wrong)) * 100) : 0,
+            submittedAt: Date.now(),
+            quizType: 'daily'
+        };
+        console.log('✅ Daily score saved:', name, '| Score:', scoreRounded);
+    }
+
+    // ✅ Also update XP leaderboard
+    if (!leaderboard[deviceId]) {
+        leaderboard[deviceId] = {
+            id: deviceId, name: name || 'User',
+            xp: 0, quizzes: 0, correct: 0, wrong: 0,
+            bestStreak: 0, joinedAt: Date.now(), lastPlayed: Date.now()
+        };
+    }
+
+    const user = leaderboard[deviceId];
+    const xpGained = Math.max(0, correct * 10 - wrong * 3);
+    user.xp += xpGained;
+    user.quizzes += 1;
+    user.correct += correct;
+    user.wrong += wrong;
+    user.bestStreak = Math.max(user.bestStreak, streak || 0);
+    user.lastPlayed = Date.now();
+    if (name) user.name = name;
+
+    const total = user.correct + user.wrong;
+    user.accuracy = total > 0 ? Math.round((user.correct / total) * 100) : 0;
+
+    saveLeaderboard();
+
+    // Calculate rank
+    const sorted = Object.values(dailyQuizRecords[today])
+        .sort((a, b) => {
+            if (b.score !== a.score) return b.score - a.score;
+            return a.timeTaken - b.timeTaken;
+        });
+
+    const rank = sorted.findIndex(u => u.id === deviceId) + 1;
+
+    res.json({
+        ok: true,
+        rank,
+        score: scoreRounded,
+        totalUsers: sorted.length,
+        xpGained: xpGained,
+        date: today
+    });
+});
+
+/* ================= LEADERBOARD: XP SUBMIT (All Quizzes) ================= */
 app.post('/api/leaderboard/submit', async (req, res) => {
     const { deviceId, name, xp, correct, wrong, streak } = req.body;
     if (!deviceId) return res.status(400).json({ ok: false });
@@ -443,7 +550,7 @@ app.post('/api/leaderboard/submit', async (req, res) => {
     const sorted = Object.values(leaderboard).sort((a, b) => b.xp - a.xp);
     const rank = sorted.findIndex(u => u.id === deviceId) + 1;
 
-    const today = new Date().toISOString().split('T')[0];
+    const today = getToday();
     if (!dailyStats[today]) dailyStats[today] = { activeUsers: 0, quizzes: 0 };
     dailyStats[today].quizzes = (dailyStats[today].quizzes || 0) + 1;
     dailyStats[today].activeUsers = Object.keys(leaderboard).length;
@@ -452,70 +559,83 @@ app.post('/api/leaderboard/submit', async (req, res) => {
     res.json({ ok: true, rank, xp: user.xp, totalUsers: sorted.length });
 });
 
-/* ================= LEADERBOARD: DAILY SUBMIT (with Time) ================= */
-app.post('/api/leaderboard/daily-submit', async (req, res) => {
-    const { deviceId, name, correct, wrong, timeTaken, streak, totalQuestions } = req.body;
-    if (!deviceId) return res.status(400).json({ ok: false });
+/* ================= LEADERBOARD: GET DAILY (Sirf Aaj) ================= */
+app.get('/api/leaderboard/daily', (req, res) => {
+    const today = getToday();
+    const date = req.query.date || today;
+    const limit = parseInt(req.query.limit || '50');
+    const records = dailyQuizRecords[date] || {};
 
-    const negativeMark = wrong / 3;
-    const score = Math.max(0, correct - negativeMark);
-    const scoreRounded = Math.round(score * 100) / 100;
+    console.log('📅 Daily request:', date, '| Records:', Object.keys(records).length);
 
-    const today = new Date().toISOString().split('T')[0];
-    if (!dailyQuizRecords[today]) dailyQuizRecords[today] = {};
-
-    const existing = dailyQuizRecords[today][deviceId];
-    const isBetter = !existing ||
-        scoreRounded > existing.score ||
-        (scoreRounded === existing.score && timeTaken < existing.timeTaken);
-
-    if (isBetter) {
-        dailyQuizRecords[today][deviceId] = {
-            id: deviceId, name: name || 'User',
-            score: scoreRounded, correct: correct || 0, wrong: wrong || 0,
-            timeTaken: timeTaken || 0, streak: streak || 0,
-            totalQuestions: totalQuestions || 0,
-            accuracy: correct > 0 ? Math.round((correct / (correct + wrong)) * 100) : 0,
-            submittedAt: Date.now()
-        };
-
-        // Also update main XP leaderboard
-        if (!leaderboard[deviceId]) {
-            leaderboard[deviceId] = {
-                id: deviceId, name: name || 'User',
-                xp: 0, quizzes: 0, correct: 0, wrong: 0,
-                bestStreak: 0, joinedAt: Date.now(), lastPlayed: Date.now()
-            };
-        }
-        const u = leaderboard[deviceId];
-        const xpGained = Math.max(0, correct * 10 - wrong * 3);
-        u.xp += xpGained;
-        u.quizzes += 1;
-        u.correct += correct;
-        u.wrong += wrong;
-        u.bestStreak = Math.max(u.bestStreak, streak || 0);
-        u.lastPlayed = Date.now();
-        if (name) u.name = name;
-        const tot = u.correct + u.wrong;
-        u.accuracy = tot > 0 ? Math.round((u.correct / tot) * 100) : 0;
-
-        saveLeaderboard();
-    }
-
-    const sorted = Object.values(dailyQuizRecords[today]).sort((a, b) => {
-        if (b.score !== a.score) return b.score - a.score;
-        return a.timeTaken - b.timeTaken;
-    });
-    const rank = sorted.findIndex(u => u.id === deviceId) + 1;
+    const sorted = Object.values(records)
+        .sort((a, b) => {
+            if (b.score !== a.score) return b.score - a.score;
+            return a.timeTaken - b.timeTaken;
+        })
+        .slice(0, limit)
+        .map((u, i) => ({
+            ...u,
+            rank: i + 1
+        }));
 
     res.json({
-        ok: true, rank, score: scoreRounded,
-        totalUsers: sorted.length,
-        xpGained: Math.max(0, correct * 10 - wrong * 3)
+        ok: true,
+        date: date,
+        isToday: date === today,
+        top: sorted,
+        totalUsers: Object.keys(records).length,
+        updatedAt: Date.now()
     });
 });
 
-/* ================= LEADERBOARD: GET TOP XP ================= */
+/* ================= LEADERBOARD: GET XP (All Time) ================= */
+app.get('/api/leaderboard/xp', (req, res) => {
+    const limit = parseInt(req.query.limit || '50');
+    const sorted = Object.values(leaderboard)
+        .sort((a, b) => b.xp - a.xp)
+        .slice(0, limit)
+        .map((u, i) => ({
+            rank: i + 1,
+            id: u.id,
+            name: u.name,
+            xp: u.xp,
+            quizzes: u.quizzes,
+            accuracy: u.accuracy,
+            bestStreak: u.bestStreak,
+            lastPlayed: u.lastPlayed
+        }));
+    res.json({
+        ok: true,
+        top: sorted,
+        totalUsers: Object.keys(leaderboard).length,
+        updatedAt: Date.now()
+    });
+});
+
+/* ================= LEADERBOARD: GET STREAK ================= */
+app.get('/api/leaderboard/streak', (req, res) => {
+    const limit = parseInt(req.query.limit || '50');
+    const sorted = Object.values(leaderboard)
+        .sort((a, b) => b.bestStreak - a.bestStreak)
+        .slice(0, limit)
+        .map((u, i) => ({
+            rank: i + 1,
+            id: u.id,
+            name: u.name,
+            streak: u.bestStreak || 0,
+            xp: u.xp,
+            quizzes: u.quizzes,
+            accuracy: u.accuracy
+        }));
+    res.json({
+        ok: true,
+        top: sorted,
+        totalUsers: Object.keys(leaderboard).length
+    });
+});
+
+/* ================= LEADERBOARD: GET TOP (Combined) ================= */
 app.get('/api/leaderboard', (req, res) => {
     const limit = parseInt(req.query.limit || '50');
     const sorted = Object.values(leaderboard)
@@ -526,50 +646,12 @@ app.get('/api/leaderboard', (req, res) => {
         })
         .slice(0, limit)
         .map((u, i) => ({ ...u, rank: i + 1 }));
-    res.json({ ok: true, top: sorted, totalUsers: Object.keys(leaderboard).length, updatedAt: Date.now() });
-});
-
-/* ================= LEADERBOARD: GET DAILY ================= */
-app.get('/api/leaderboard/daily', (req, res) => {
-    const date = req.query.date || new Date().toISOString().split('T')[0];
-    const limit = parseInt(req.query.limit || '50');
-    const records = dailyQuizRecords[date] || {};
-    const sorted = Object.values(records)
-        .sort((a, b) => {
-            if (b.score !== a.score) return b.score - a.score;
-            return a.timeTaken - b.timeTaken;
-        })
-        .slice(0, limit)
-        .map((u, i) => ({ ...u, rank: i + 1 }));
-    res.json({ ok: true, date, top: sorted, totalUsers: Object.keys(records).length });
-});
-
-/* ================= LEADERBOARD: GET STREAK ================= */
-app.get('/api/leaderboard/streak', (req, res) => {
-    const limit = parseInt(req.query.limit || '50');
-    const sorted = Object.values(leaderboard)
-        .sort((a, b) => b.bestStreak - a.bestStreak)
-        .slice(0, limit)
-        .map((u, i) => ({
-            rank: i + 1, id: u.id, name: u.name,
-            streak: u.bestStreak || 0, xp: u.xp,
-            quizzes: u.quizzes, accuracy: u.accuracy
-        }));
-    res.json({ ok: true, top: sorted, totalUsers: Object.keys(leaderboard).length });
-});
-
-/* ================= LEADERBOARD: GET XP ================= */
-app.get('/api/leaderboard/xp', (req, res) => {
-    const limit = parseInt(req.query.limit || '50');
-    const sorted = Object.values(leaderboard)
-        .sort((a, b) => b.xp - a.xp)
-        .slice(0, limit)
-        .map((u, i) => ({
-            rank: i + 1, id: u.id, name: u.name,
-            xp: u.xp, quizzes: u.quizzes,
-            accuracy: u.accuracy, bestStreak: u.bestStreak
-        }));
-    res.json({ ok: true, top: sorted, totalUsers: Object.keys(leaderboard).length });
+    res.json({
+        ok: true,
+        top: sorted,
+        totalUsers: Object.keys(leaderboard).length,
+        updatedAt: Date.now()
+    });
 });
 
 /* ================= LEADERBOARD: USER RANK ================= */
@@ -580,7 +662,8 @@ app.get('/api/leaderboard/rank/:deviceId', (req, res) => {
     const rank = sorted.findIndex(u => u.id === deviceId) + 1;
     const total = sorted.length;
     res.json({
-        ok: true, rank,
+        ok: true,
+        rank,
         user: leaderboard[deviceId],
         totalUsers: total,
         percentile: total > 0 ? Math.round(((total - rank) / total) * 100) : 0
@@ -590,7 +673,8 @@ app.get('/api/leaderboard/rank/:deviceId', (req, res) => {
 /* ================= LEADERBOARD: USER DAILY RANK ================= */
 app.get('/api/leaderboard/daily-rank/:deviceId', (req, res) => {
     const { deviceId } = req.params;
-    const date = req.query.date || new Date().toISOString().split('T')[0];
+    const today = getToday();
+    const date = req.query.date || today;
     const records = dailyQuizRecords[date] || {};
     if (!records[deviceId]) return res.json({ ok: true, rank: null, user: null });
     const sorted = Object.values(records).sort((a, b) => {
@@ -600,16 +684,18 @@ app.get('/api/leaderboard/daily-rank/:deviceId', (req, res) => {
     const rank = sorted.findIndex(u => u.id === deviceId) + 1;
     const total = sorted.length;
     res.json({
-        ok: true, rank,
+        ok: true,
+        rank,
         user: records[deviceId],
         totalUsers: total,
-        percentile: total > 0 ? Math.round(((total - rank) / total) * 100) : 0
+        percentile: total > 0 ? Math.round(((total - rank) / total) * 100) : 0,
+        date: date
     });
 });
 
 /* ================= STATS: DAILY ================= */
 app.get('/api/stats/daily', (req, res) => {
-    const today = new Date().toISOString().split('T')[0];
+    const today = getToday();
     res.json({
         ok: true,
         today: dailyStats[today] || { activeUsers: 0, quizzes: 0, messages: 0 },
